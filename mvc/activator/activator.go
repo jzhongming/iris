@@ -46,8 +46,8 @@ type (
 
 var (
 	// ErrMissingControllerInstance is a static error which fired from `Controller` when
-	// the passed "c" instnace is not a valid type of `Controller`.
-	ErrMissingControllerInstance = errors.New("controller should have a field of Controller type")
+	// the passed "c" instnace is not a valid type of `Controller` or `C`.
+	ErrMissingControllerInstance = errors.New("controller should have a field of mvc.Controller or mvc.C type")
 	// ErrInvalidControllerType fired when the "Controller" field is not
 	// the correct type.
 	ErrInvalidControllerType = errors.New("controller instance is not a valid implementation")
@@ -57,6 +57,11 @@ var (
 // which the main request `Controller` will implement automatically.
 // End-User doesn't need to have any knowledge of this if she/he doesn't want to implement
 // a new Controller type.
+// Controller looks the whole flow as one handler, so `ctx.Next`
+// inside `BeginRequest` is not be respected.
+// Alternative way to check if a middleware was procceed successfully
+// and called its `ctx.Next` is the `ctx.Proceed(handler) bool`.
+// You have to navigate to the `context/context#Proceed` function's documentation.
 type BaseController interface {
 	SetName(name string)
 	BeginRequest(ctx context.Context)
@@ -131,9 +136,15 @@ func (t TController) HandlerOf(methodFunc methodfunc.MethodFunc) context.Handler
 			t.persistenceController.Handle(c)
 		}
 
+		// if previous (binded) handlers stopped the execution
+		// we should know that.
+		if ctx.IsStopped() {
+			return
+		}
+
 		// init the request.
 		b.BeginRequest(ctx)
-		if ctx.IsStopped() {
+		if ctx.IsStopped() { // if begin request stopped the execution
 			return
 		}
 
@@ -146,7 +157,8 @@ func (t TController) HandlerOf(methodFunc methodfunc.MethodFunc) context.Handler
 			t.modelController.Handle(ctx, c)
 		}
 
-		// finally, execute the controller, don't check for IsStopped.
+		// end the request, don't check for stopped because this does the actual writing
+		// if no response written already.
 		b.EndRequest(ctx)
 	}
 }
@@ -170,8 +182,11 @@ func RegisterMethodHandlers(t TController, registerFunc RegisterFunc) {
 	}
 	// the actual method functions
 	// i.e for "GET" it's the `Get()`.
-	methods := methodfunc.Resolve(t.Type)
-
+	methods, err := methodfunc.Resolve(t.Type)
+	if err != nil {
+		golog.Errorf("MVC %s: %s", t.FullName, err.Error())
+		// don't stop here.
+	}
 	// range over the type info's method funcs,
 	// build a new handler for each of these
 	// methods and register them to their
@@ -181,7 +196,7 @@ func RegisterMethodHandlers(t TController, registerFunc RegisterFunc) {
 	for _, m := range methods {
 		h := t.HandlerOf(m)
 		if h == nil {
-			golog.Debugf("MVC %s: nil method handler found for %s", t.FullName, m.Name)
+			golog.Warnf("MVC %s: nil method handler found for %s", t.FullName, m.Name)
 			continue
 		}
 		registeredHandlers := append(middleware, h)

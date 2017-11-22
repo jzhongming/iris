@@ -1,2 +1,5 @@
-Documentation for the _iris_ project can be found at
-<https://github.com/kataras/iris#-learn>.
+Documentation for the Iris project can be found at
+<https://iris-go.com/v8/recipe>.
+
+Love iris? Please consider supporting our collective:
+👉  https://opencollective.com/iris/donate

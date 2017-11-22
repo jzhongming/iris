@@ -196,7 +196,6 @@ type (
 		underline                UnderlineConnection
 		id                       string
 		messageType              int
-		pinger                   *time.Ticker
 		disconnected             bool
 		onDisconnectListeners    []DisconnectFunc
 		onRoomLeaveListeners     []LeaveRoomFunc
@@ -250,7 +249,7 @@ func newConnection(ctx context.Context, s *Server, underlineConn UnderlineConnec
 
 // write writes a raw websocket message with a specific type to the client
 // used by ping messages and any CloseMessage types.
-func (c *connection) write(websocketMessageType int, data []byte) {
+func (c *connection) write(websocketMessageType int, data []byte) error {
 	// for any-case the app tries to write from different goroutines,
 	// we must protect them because they're reporting that as bug...
 	c.writerMu.Lock()
@@ -266,6 +265,7 @@ func (c *connection) write(websocketMessageType int, data []byte) {
 		// if failed then the connection is off, fire the disconnect
 		c.Disconnect()
 	}
+	return err
 }
 
 // writeDefault is the same as write but the message type is the configured by c.messageType
@@ -297,15 +297,20 @@ func (c *connection) startPinger() {
 
 	c.underline.SetPingHandler(pingHandler)
 
-	// start a new timer ticker based on the configuration
-	c.pinger = time.NewTicker(c.server.config.PingPeriod)
-
 	go func() {
 		for {
-			// wait for each tick
-			<-c.pinger.C
+			// using sleep avoids the ticker error that causes a memory leak
+			time.Sleep(c.server.config.PingPeriod)
+			if c.disconnected {
+				// verifies if already disconected
+				break
+			}
 			// try to ping the client, if failed then it disconnects
-			c.write(websocket.PingMessage, []byte{})
+			err := c.write(websocket.PingMessage, []byte{})
+			if err != nil {
+				// must stop to exit the loop and finish the go routine
+				break
+			}
 		}
 	}()
 }
@@ -477,6 +482,10 @@ func (c *connection) OnLeave(roomLeaveCb LeaveRoomFunc) {
 }
 
 func (c *connection) fireOnLeave(roomName string) {
+	// check if connection is already closed
+	if c == nil {
+		return
+	}
 	// fire the onRoomLeaveListeners
 	for i := range c.onRoomLeaveListeners {
 		c.onRoomLeaveListeners[i](roomName)

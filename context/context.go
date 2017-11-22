@@ -17,7 +17,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -125,7 +124,7 @@ func (r RequestParams) GetInt64(key string) (int64, error) {
 
 // GetFloat64 returns a path parameter's value based as float64 on its route's dynamic path key.
 func (r RequestParams) GetFloat64(key string) (float64, error) {
-	return strconv.ParseFloat(r.Get(key), 64)
+	return r.store.GetFloat64(key)
 }
 
 // GetBool returns the path parameter's value as bool, based on its key.
@@ -242,6 +241,45 @@ type Context interface {
 	//
 	// Look Handlers(), Next() and StopExecution() too.
 	HandlerIndex(n int) (currentIndex int)
+	// Proceed is an alternative way to check if a particular handler
+	// has been executed and called the `ctx.Next` function inside it.
+	// This is useful only when you run a handler inside
+	// another handler. It justs checks for before index and the after index.
+	//
+	// A usecase example is when you want to execute a middleware
+	// inside controller's `BeginRequest` that calls the `ctx.Next` inside it.
+	// The Controller looks the whole flow (BeginRequest, method handler, EndRequest)
+	// as one handler, so `ctx.Next` will not be reflected to the method handler
+	// if called from the `BeginRequest`.
+	//
+	// Although `BeginRequest` should NOT be used to call other handlers,
+	// the `BeginRequest` has been introduced to be able to set
+	// common data to all method handlers before their execution.
+	// Controllers can accept middleware(s) from the `app.Controller`
+	// function.
+	//
+	// That said let's see an example of `ctx.Proceed`:
+	//
+	// var authMiddleware = basicauth.New(basicauth.Config{
+	// 	Users: map[string]string{
+	// 		"admin": "password",
+	// 	},
+	// })
+	//
+	// func (c *UsersController) BeginRequest(ctx iris.Context) {
+	//	c.C.BeginRequest(ctx) // call the parent's base controller BeginRequest first.
+	// 	if !ctx.Proceed(authMiddleware) {
+	// 		ctx.StopExecution()
+	// 	}
+	// }
+	// This Get() will be executed in the same handler as `BeginRequest`,
+	// internally controller checks for `ctx.StopExecution`.
+	// So it will not be fired if BeginRequest called the `StopExecution`.
+	// func(c *UsersController) Get() []models.User {
+	//	  return c.Service.GetAll()
+	//}
+	// Alternative way is `!ctx.IsStopped()` if middleware make use of the `ctx.StopExecution()` on failure.
+	Proceed(Handler) bool
 	// HandlerName returns the current handler's name, helpful for debugging.
 	HandlerName() string
 	// Next calls all the next handler from the handlers chain,
@@ -256,7 +294,8 @@ type Context interface {
 	// Skip skips/ignores the next handler from the handlers chain,
 	// it should be used inside a middleware.
 	Skip()
-	// StopExecution if called then the following .Next calls are ignored.
+	// StopExecution if called then the following .Next calls are ignored,
+	// as a result the next handlers in the chain will not be fire.
 	StopExecution()
 	// IsStopped checks and returns true if the current position of the Context is 255,
 	// means that the StopExecution() was called.
@@ -353,11 +392,15 @@ type Context interface {
 	// Look StatusCode too.
 	GetStatusCode() int
 
-	// Redirect redirect sends a redirect response the client
+	// Redirect sends a redirect response to the client
+	// to a specific url or relative path.
 	// accepts 2 parameters string and an optional int
 	// first parameter is the url to redirect
-	// second parameter is the http status should send, default is 302 (StatusFound),
-	// you can set it to 301 (Permant redirect), if that's nessecery
+	// second parameter is the http status should send,
+	// default is 302 (StatusFound),
+	// you can set it to 301 (Permant redirect)
+	// or 303 (StatusSeeOther) if POST method,
+	// or StatusTemporaryRedirect(307) if that's nessecery.
 	Redirect(urlToRedirect string, statusHeader ...int)
 
 	//  +------------------------------------------------------------+
@@ -858,11 +901,22 @@ func (ctx *context) EndRequest() {
 		// author's note:
 		// if recording, the error handler can handle
 		// the rollback and remove any response written before,
-		// we don't have to do anything here, written is -1 when Recording
+		// we don't have to do anything here, written is <=0 (-1 for default empty, even no status code)
+		// when Recording
 		// because we didn't flush the response yet
 		// if !recording  then check if the previous handler didn't send something
-		// to the client
-		if ctx.writer.Written() == -1 {
+		// to the client.
+		if ctx.writer.Written() <= 0 {
+			// Author's notes:
+			// previously: == -1,
+			// <=0 means even if empty write called which has meaning;
+			// rel: core/router/status.go#Fire-else
+			// mvc/activator/funcmethod/func_result_dispatcher.go#DispatchCommon-write
+			// mvc/response.go#defaultFailureResponse - no text given but
+			// status code should be fired, but it couldn't because of the .Write
+			// action, the .Written() was 0 even on empty response, this 0 means that
+			// a status code given, the previous check of the "== -1" didn't make check for that,
+			// we do now.
 			ctx.Application().FireErrorCode(ctx)
 		}
 	}
@@ -952,9 +1006,56 @@ func (ctx *context) HandlerIndex(n int) (currentIndex int) {
 	return n
 }
 
+// Proceed is an alternative way to check if a particular handler
+// has been executed and called the `ctx.Next` function inside it.
+// This is useful only when you run a handler inside
+// another handler. It justs checks for before index and the after index.
+//
+// A usecase example is when you want to execute a middleware
+// inside controller's `BeginRequest` that calls the `ctx.Next` inside it.
+// The Controller looks the whole flow (BeginRequest, method handler, EndRequest)
+// as one handler, so `ctx.Next` will not be reflected to the method handler
+// if called from the `BeginRequest`.
+//
+// Although `BeginRequest` should NOT be used to call other handlers,
+// the `BeginRequest` has been introduced to be able to set
+// common data to all method handlers before their execution.
+// Controllers can accept middleware(s) from the `app.Controller`
+// function.
+//
+// That said let's see an example of `ctx.Proceed`:
+//
+// var authMiddleware = basicauth.New(basicauth.Config{
+// 	Users: map[string]string{
+// 		"admin": "password",
+// 	},
+// })
+//
+// func (c *UsersController) BeginRequest(ctx iris.Context) {
+//	c.C.BeginRequest(ctx) // call the parent's base controller BeginRequest first.
+// 	if !ctx.Proceed(authMiddleware) {
+// 		ctx.StopExecution()
+// 	}
+// }
+// This Get() will be executed in the same handler as `BeginRequest`,
+// internally controller checks for `ctx.StopExecution`.
+// So it will not be fired if BeginRequest called the `StopExecution`.
+// func(c *UsersController) Get() []models.User {
+//	  return c.Service.GetAll()
+//}
+// Alternative way is `!ctx.IsStopped()` if middleware make use of the `ctx.StopExecution()` on failure.
+func (ctx *context) Proceed(h Handler) bool {
+	beforeIdx := ctx.currentHandlerIndex
+	h(ctx)
+	if ctx.currentHandlerIndex > beforeIdx && !ctx.IsStopped() {
+		return true
+	}
+	return false
+}
+
 // HandlerName returns the current handler's name, helpful for debugging.
 func (ctx *context) HandlerName() string {
-	return runtime.FuncForPC(reflect.ValueOf(ctx.handlers[ctx.currentHandlerIndex]).Pointer()).Name()
+	return HandlerName(ctx.handlers[ctx.currentHandlerIndex])
 }
 
 // Do sets the handler index to zero, executes the first handler
@@ -995,7 +1096,8 @@ func (ctx *context) Skip() {
 
 const stopExecutionIndex = -1 // I don't set to a max value because we want to be able to reuse the handlers even if stopped with .Skip
 
-// StopExecution if called then the following .Next calls are ignored.
+// StopExecution if called then the following .Next calls are ignored,
+// as a result the next handlers in the chain will not be fire.
 func (ctx *context) StopExecution() {
 	ctx.currentHandlerIndex = stopExecutionIndex
 }
@@ -1233,7 +1335,7 @@ func (ctx *context) ContentType(cType string) {
 	}
 	// if doesn't contain a charset already then append it
 	if !strings.Contains(cType, "charset") {
-		if cType != contentBinaryHeaderValue {
+		if cType != ContentBinaryHeaderValue {
 			charset := ctx.Application().ConfigurationReadOnly().GetCharset()
 			cType += "; charset=" + charset
 		}
@@ -1520,14 +1622,17 @@ func (ctx *context) FormFile(key string) (multipart.File, *multipart.FileHeader,
 	return ctx.request.FormFile(key)
 }
 
-// Redirect redirect sends a redirect response the client
+// Redirect sends a redirect response to the client
+// to a specific url or relative path.
 // accepts 2 parameters string and an optional int
 // first parameter is the url to redirect
-// second parameter is the http status should send, default is 302 (StatusFound),
-// you can set it to 301 (Permant redirect), if that's nessecery
+// second parameter is the http status should send,
+// default is 302 (StatusFound),
+// you can set it to 301 (Permant redirect)
+// or 303 (StatusSeeOther) if POST method,
+// or StatusTemporaryRedirect(307) if that's nessecery.
 func (ctx *context) Redirect(urlToRedirect string, statusHeader ...int) {
 	ctx.StopExecution()
-
 	// get the previous status code given by the end-developer.
 	status := ctx.GetStatusCode()
 	if status < 300 { // the previous is not a RCF-valid redirect status.
@@ -1941,7 +2046,7 @@ func (ctx *context) GetViewData() map[string]interface{} {
 //
 // Examples: https://github.com/kataras/iris/tree/master/_examples/view/
 func (ctx *context) View(filename string) error {
-	ctx.ContentType(contentHTMLHeaderValue)
+	ctx.ContentType(ContentHTMLHeaderValue)
 	cfg := ctx.Application().ConfigurationReadOnly()
 
 	layout := ctx.values.GetString(cfg.GetViewLayoutContextKey())
@@ -1957,38 +2062,38 @@ func (ctx *context) View(filename string) error {
 }
 
 const (
-	// contentBinaryHeaderValue header value for binary data.
-	contentBinaryHeaderValue = "application/octet-stream"
-	// contentHTMLHeaderValue is the  string of text/html response header's content type value.
-	contentHTMLHeaderValue = "text/html"
-	// ContentJSON header value for JSON data.
-	contentJSONHeaderValue = "application/json"
-	// ContentJSONP header value for JSONP & Javascript data.
-	contentJavascriptHeaderValue = "application/javascript"
-	// contentTextHeaderValue header value for Text data.
-	contentTextHeaderValue = "text/plain"
-	// contentXMLHeaderValue header value for XML data.
-	contentXMLHeaderValue = "text/xml"
+	// ContentBinaryHeaderValue header value for binary data.
+	ContentBinaryHeaderValue = "application/octet-stream"
+	// ContentHTMLHeaderValue is the  string of text/html response header's content type value.
+	ContentHTMLHeaderValue = "text/html"
+	// ContentJSONHeaderValue header value for JSON data.
+	ContentJSONHeaderValue = "application/json"
+	// ContentJavascriptHeaderValue header value for JSONP & Javascript data.
+	ContentJavascriptHeaderValue = "application/javascript"
+	// ContentTextHeaderValue header value for Text data.
+	ContentTextHeaderValue = "text/plain"
+	// ContentXMLHeaderValue header value for XML data.
+	ContentXMLHeaderValue = "text/xml"
 
-	// contentMarkdownHeaderValue custom key/content type, the real is the text/html.
-	contentMarkdownHeaderValue = "text/markdown"
+	// ContentMarkdownHeaderValue custom key/content type, the real is the text/html.
+	ContentMarkdownHeaderValue = "text/markdown"
 )
 
 // Binary writes out the raw bytes as binary data.
 func (ctx *context) Binary(data []byte) (int, error) {
-	ctx.ContentType(contentBinaryHeaderValue)
+	ctx.ContentType(ContentBinaryHeaderValue)
 	return ctx.Write(data)
 }
 
 // Text writes out a string as plain text.
 func (ctx *context) Text(text string) (int, error) {
-	ctx.ContentType(contentTextHeaderValue)
+	ctx.ContentType(ContentTextHeaderValue)
 	return ctx.writer.WriteString(text)
 }
 
 // HTML writes out a string as text/html.
 func (ctx *context) HTML(htmlContents string) (int, error) {
-	ctx.ContentType(contentHTMLHeaderValue)
+	ctx.ContentType(ContentHTMLHeaderValue)
 	return ctx.writer.WriteString(htmlContents)
 }
 
@@ -2078,11 +2183,13 @@ func WriteJSON(writer io.Writer, v interface{}, options JSON, enableOptimization
 	return writer.Write(result)
 }
 
-var defaultJSONOptions = JSON{}
+// DefaultJSONOptions is the optional settings that are being used
+// inside `ctx.JSON`.
+var DefaultJSONOptions = JSON{}
 
 // JSON marshals the given interface object and writes the JSON response to the client.
 func (ctx *context) JSON(v interface{}, opts ...JSON) (n int, err error) {
-	options := defaultJSONOptions
+	options := DefaultJSONOptions
 
 	if len(opts) > 0 {
 		options = opts[0]
@@ -2090,7 +2197,7 @@ func (ctx *context) JSON(v interface{}, opts ...JSON) (n int, err error) {
 
 	optimize := ctx.shouldOptimize()
 
-	ctx.ContentType(contentJSONHeaderValue)
+	ctx.ContentType(ContentJSONHeaderValue)
 
 	if options.StreamingJSON {
 		if optimize {
@@ -2162,17 +2269,19 @@ func WriteJSONP(writer io.Writer, v interface{}, options JSONP, enableOptimizati
 	return writer.Write(result)
 }
 
-var defaultJSONPOptions = JSONP{}
+// DefaultJSONPOptions is the optional settings that are being used
+// inside `ctx.JSONP`.
+var DefaultJSONPOptions = JSONP{}
 
 // JSONP marshals the given interface object and writes the JSON response to the client.
 func (ctx *context) JSONP(v interface{}, opts ...JSONP) (int, error) {
-	options := defaultJSONPOptions
+	options := DefaultJSONPOptions
 
 	if len(opts) > 0 {
 		options = opts[0]
 	}
 
-	ctx.ContentType(contentJavascriptHeaderValue)
+	ctx.ContentType(ContentJavascriptHeaderValue)
 
 	n, err := WriteJSONP(ctx.writer, v, options, ctx.shouldOptimize())
 	if err != nil {
@@ -2205,17 +2314,19 @@ func WriteXML(writer io.Writer, v interface{}, options XML) (int, error) {
 	return writer.Write(result)
 }
 
-var defaultXMLOptions = XML{}
+// DefaultXMLOptions is the optional settings that are being used
+// from `ctx.XML`.
+var DefaultXMLOptions = XML{}
 
 // XML marshals the given interface object and writes the XML response to the client.
 func (ctx *context) XML(v interface{}, opts ...XML) (int, error) {
-	options := defaultXMLOptions
+	options := DefaultXMLOptions
 
 	if len(opts) > 0 {
 		options = opts[0]
 	}
 
-	ctx.ContentType(contentXMLHeaderValue)
+	ctx.ContentType(ContentXMLHeaderValue)
 
 	n, err := WriteXML(ctx.writer, v, options)
 	if err != nil {
@@ -2235,17 +2346,19 @@ func WriteMarkdown(writer io.Writer, markdownB []byte, options Markdown) (int, e
 	return writer.Write(buf)
 }
 
-var defaultMarkdownOptions = Markdown{}
+// DefaultMarkdownOptions is the optional settings that are being used
+// from `WriteMarkdown` and `ctx.Markdown`.
+var DefaultMarkdownOptions = Markdown{}
 
 // Markdown parses the markdown to html and renders to the client.
 func (ctx *context) Markdown(markdownB []byte, opts ...Markdown) (int, error) {
-	options := defaultMarkdownOptions
+	options := DefaultMarkdownOptions
 
 	if len(opts) > 0 {
 		options = opts[0]
 	}
 
-	ctx.ContentType(contentHTMLHeaderValue)
+	ctx.ContentType(ContentHTMLHeaderValue)
 
 	n, err := WriteMarkdown(ctx.writer, markdownB, options)
 	if err != nil {
@@ -2460,7 +2573,7 @@ var errTransactionInterrupted = errors.New("transaction interrupted, recovery fr
 // it's not covers all paths,
 // such as databases, this should be managed by the libraries you use to make your database connection,
 // this transaction scope is only for context's response.
-// Transactions have their own middleware ecosystem also, look iris.go:UseTransaction.
+// Transactions have their own middleware ecosystem also.
 //
 // See https://github.com/kataras/iris/tree/master/_examples/ for more
 func (ctx *context) BeginTransaction(pipe func(t *Transaction)) {
